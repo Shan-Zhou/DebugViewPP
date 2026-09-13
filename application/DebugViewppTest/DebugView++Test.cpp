@@ -6,6 +6,7 @@
 #define BOOST_TEST_MODULE DebugView++ Lib Unit Test
 
 #include <boost/test/unit_test_gui.hpp>
+#include "Win32/Process.h"
 
 #include <filesystem>
 #include <random>
@@ -494,16 +495,15 @@ BOOST_AUTO_TEST_CASE(LogSourceDBWinReader)
 {
     using namespace std::chrono_literals;
 
-    std::string dbgMsgSrc = stringbuilder() << GetExecutePath() << "\\DbgMsgSrc.exe";
-    BOOST_TEST(FileExists(dbgMsgSrc.c_str()));
-    std::string cmd = stringbuilder() << dbgMsgSrc << " -n";
+    auto dbgMsgSrc = std::filesystem::path(GetExecutePath()) / "DbgMsgSrc.exe";
+    BOOST_TEST(std::filesystem::exists(dbgMsgSrc));
     auto executor = std::make_unique<ActiveExecutorClient>();
     Lines lines;
     {
         LogSources logsources(*executor, true);
         executor->Call([&] { logsources.SetAutoNewLine(true); });
         executor->Call([&] { logsources.AddDBWinReader(false); });
-        system(cmd.c_str());
+        Win32::Process(dbgMsgSrc.wstring(), L"-n").Wait();
         executor->Call([&] { logsources.Abort(); });
         executor->Call([&] { lines = logsources.GetLines(); });
     }
@@ -620,6 +620,31 @@ void RemoveLinesFromFile(const std::string& filename, int linesToRemove)
     Win32::HFile(GetTestFileName()).resize(offset);
 }
 
+Lines WaitForLines(ActiveExecutorClient& executor, LogSources& logsources, size_t expectedCount,
+                   std::chrono::milliseconds timeout = std::chrono::milliseconds(2000),
+                   std::chrono::milliseconds interval = std::chrono::milliseconds(50))
+{
+    Lines accumulated;
+    const auto startTime = std::chrono::steady_clock::now();
+    while (accumulated.size() < expectedCount)
+    {
+        Lines batch;
+        executor.Call([&] { batch = logsources.GetLines(); });
+        accumulated.insert(accumulated.end(),
+                           std::make_move_iterator(batch.begin()),
+                           std::make_move_iterator(batch.end()));
+
+        if (accumulated.size() >= expectedCount)
+            break;
+
+        if (std::chrono::steady_clock::now() - startTime >= timeout)
+            break;
+
+        std::this_thread::sleep_for(interval);
+    }
+    return accumulated;
+}
+
 BOOST_AUTO_TEST_CASE(LogSourceAnyFileReader)
 {
     using namespace std::chrono_literals;
@@ -628,10 +653,8 @@ BOOST_AUTO_TEST_CASE(LogSourceAnyFileReader)
     auto filename = CreateTestFile();
     executor->Call([&] { logsources.SetAutoNewLine(true); });
     executor->Call([&] { logsources.AddAnyFileReader(WStr(filename), true); });
-    std::this_thread::sleep_for(200ms);
 
-    Lines lines;
-    executor->Call([&] { lines = logsources.GetLines(); });
+    auto lines = WaitForLines(*executor, logsources, 5);
     BOOST_TEST(lines.size() == 5);
 }
 
@@ -643,20 +666,24 @@ BOOST_AUTO_TEST_CASE(LogSourceAnyFileReaderResychronizeShrinkingFile)
     auto filename = CreateTestFile();
     executor->Call([&] { logsources.SetAutoNewLine(true); });
     executor->Call([&] { logsources.AddAnyFileReader(WStr(filename), true); });
-    std::this_thread::sleep_for(200ms);
 
-    Lines lines;
-    executor->Call([&] { lines = logsources.GetLines(); });
+    auto lines = WaitForLines(*executor, logsources, 5);
     BOOST_TEST(lines.size() == 5);
 
     RemoveLinesFromFile(GetTestFileName(), 2);
+    auto shrinkLines = WaitForLines(*executor, logsources, 1);
+    BOOST_TEST(shrinkLines.size() == 1);
+    if (!shrinkLines.empty())
+    {
+        BOOST_TEST(shrinkLines.at(0).message.find("file shrank") != std::string::npos);
+    }
+
     AppendToTestFile();
     AppendToTestFile();
     AppendToTestFile();
 
-    std::this_thread::sleep_for(200ms);
-    executor->Call([&] { lines = logsources.GetLines(); });
-    BOOST_TEST(lines.size() == 4);
+    auto appendLines = WaitForLines(*executor, logsources, 3);
+    BOOST_TEST(appendLines.size() == 3);
 }
 
 std::string GetTestFileAsString()
@@ -737,11 +764,9 @@ BOOST_AUTO_TEST_CASE(LogSourceAnyFileReaderEmptyLines)
     auto filename = CreateAsciiTestFile();
     executor->Call([&] { logsources.SetAutoNewLine(true); });
     executor->Call([&] { logsources.AddAnyFileReader(WStr(filename), true); });
-    std::this_thread::sleep_for(200ms);
 
     {
-        Lines lines;
-        executor->Call([&] { lines = logsources.GetLines(); });
+        auto lines = WaitForLines(*executor, logsources, 4);
         BOOST_TEST(lines.size() == 4);
         BOOST_TEST(lines.at(0).message.find("tailing") != std::string::npos);
         BOOST_TEST(lines.at(1).message.find("first") != std::string::npos);
@@ -766,9 +791,8 @@ BOOST_AUTO_TEST_CASE(LogSourceLoopbackOrdering)
     executor->Call([&] { logsources.AddMessage("Loopback message 2"); });
     executor->Call([&] { logsources.AddMessage("Loopback message 3"); });
     executor->Call([&] { logsources.AddAnyFileReader(WStr(filename), true); });
-    std::this_thread::sleep_for(200ms);
-    Lines lines;
-    executor->Call([&] { lines = logsources.GetLines(); });
+
+    auto lines = WaitForLines(*executor, logsources, 7);
 
     BOOST_TEST(lines.at(0).message == "Loopback message 1");
     BOOST_TEST(lines.at(1).message == "Loopback message 2");
